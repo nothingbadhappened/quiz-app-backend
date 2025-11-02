@@ -14,5 +14,10 @@
 		"typescript": "^5.5.2",
 		"vitest": "~3.2.0",
 		"wrangler": "^4.45.3"
+	},
+	"dependencies": {
+		"hono": "^4.10.4",
+		"scrypt-js": "^3.0.1",
+		"uuid": "^13.0.0"
 	}
 }

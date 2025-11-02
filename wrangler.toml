@@ -1,0 +1,18 @@
+name = "unquizzable"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+[[d1_databases]]
+binding = "DB"                         # must be DB (used in code as c.env.DB)
+database_name = "unquizzable-db"       # EXACT name from `wrangler d1 list`
+database_id = "cbc3ddb6-8f06-4c4f-961c-b1c7ccafbc12"   # EXACT UUID from `wrangler d1 list`
+
+[[kv_namespaces]]
+binding = "KV"
+id = "0558a52722dc40e29615dac38e7b8029"
+
+[triggers]
+crons = ["0 01 * * *"]  # 01:00 UTC nightly (≈ 03:00 Europe/Chisinau)
+
+[vars]
+SESSION_TTL_SECONDS = "2592000"  # 30 days
