@@ -83,14 +83,32 @@ function parseJSON<T = any>(s: string): T {
 
 app.post('/register', async (c) => {
   try {
-    const { username, locale = 'en' } = await c.req.json()
+    const { username: requestedUsername, locale = 'en' } = await c.req.json()
     const id = uuid()
 
-    await c.env.DB.batch([
-      c.env.DB.prepare('INSERT INTO user (id, username, locale) VALUES (?, ?, ?)').bind(id, username, locale),
-      c.env.DB.prepare('INSERT OR IGNORE INTO user_skill (user_id, mu) VALUES (?, 3.0)').bind(id),
-      c.env.DB.prepare('INSERT OR IGNORE INTO streak_state (user_id, current_streak, best_streak) VALUES (?, 0, 0)').bind(id),
-    ])
+    // For guest users, generate unique username with random suffix if collision occurs
+    let username = requestedUsername || `Guest_${id.slice(0, 8)}`
+    let attempts = 0
+    const maxAttempts = 5
+
+    while (attempts < maxAttempts) {
+      try {
+        await c.env.DB.batch([
+          c.env.DB.prepare('INSERT INTO user (id, username, locale) VALUES (?, ?, ?)').bind(id, username, locale),
+          c.env.DB.prepare('INSERT OR IGNORE INTO user_skill (user_id, mu) VALUES (?, 3.0)').bind(id),
+          c.env.DB.prepare('INSERT OR IGNORE INTO streak_state (user_id, current_streak, best_streak) VALUES (?, 0, 0)').bind(id),
+        ])
+        break // Success
+      } catch (e: any) {
+        if (e.message?.includes('UNIQUE constraint failed: user.username')) {
+          attempts++
+          username = `${requestedUsername || 'Guest'}_${Math.random().toString(36).substring(2, 8)}`
+          if (attempts >= maxAttempts) throw e
+        } else {
+          throw e
+        }
+      }
+    }
 
     return c.json({ userId: id, token: id })
   } catch (e: any) {
@@ -144,13 +162,37 @@ app.get('/quiz/next', async (c) => {
   const dTarget = targetDifficulty(mu)
 
   const over = n * 5
-  const { results } = await c.env.DB.prepare(
+  let { results } = await c.env.DB.prepare(
     `SELECT id, prompt, options, correct_idx, category, difficulty, lang
      FROM question
      WHERE lang = ? AND category = ? AND CAST(difficulty AS INTEGER) BETWEEN ? AND ?
      ORDER BY created_at DESC
      LIMIT ?`
   ).bind(lang, category, Math.max(1, dTarget - 1), Math.min(6, dTarget + 1), over).all<QuestionRow>()
+
+  // Fallback: if no questions match target difficulty, get any questions from lang+category
+  if (results.length === 0) {
+    const fallback = await c.env.DB.prepare(
+      `SELECT id, prompt, options, correct_idx, category, difficulty, lang
+       FROM question
+       WHERE lang = ? AND category = ?
+       ORDER BY created_at DESC
+       LIMIT ?`
+    ).bind(lang, category, over).all<QuestionRow>()
+    results = fallback.results
+  }
+
+  // Fallback 2: if still no questions, get ANY questions from lang
+  if (results.length === 0) {
+    const fallback2 = await c.env.DB.prepare(
+      `SELECT id, prompt, options, correct_idx, category, difficulty, lang
+       FROM question
+       WHERE lang = ?
+       ORDER BY created_at DESC
+       LIMIT ?`
+    ).bind(lang, over).all<QuestionRow>()
+    results = fallback2.results
+  }
 
   const seenRaw = await c.env.KV.get(`seen:${userId}`)
   const seen = new Set<string>(seenRaw ? JSON.parse(seenRaw) : [])
@@ -178,14 +220,20 @@ app.get('/quiz/next', async (c) => {
 
 app.post('/quiz/answer', async (c) => {
   const userId = c.req.header('x-user') || ''
-  const { questionId, correct, timeMs, sessionId } = await c.req.json() as {
-    questionId: string, correct: boolean, timeMs?: number, sessionId?: string
+  const { questionId, selectedIdx, timeMs, sessionId } = await c.req.json() as {
+    questionId: string, selectedIdx: number, timeMs?: number, sessionId?: string
   }
 
   const q = await c.env.DB.prepare(
-    'SELECT difficulty, category FROM question WHERE id = ?'
-  ).bind(questionId).first<{ difficulty?: string, category?: string }>()
+    'SELECT difficulty, category, correct_idx FROM question WHERE id = ?'
+  ).bind(questionId).first<{ difficulty?: string, category?: string, correct_idx?: number }>()
 
+  if (!q) {
+    return c.json({ error: 'question_not_found' }, 404)
+  }
+
+  // Both database and frontend use 0-based indexing
+  const correct = selectedIdx === q.correct_idx
   const d = clamp(parseInt(q?.difficulty ?? '3', 10) || 3, 1, 6)
 
   const rowSkill = await c.env.DB.prepare(
@@ -249,7 +297,7 @@ if (q?.category) {
 }
 
 
-  return c.json({ ok: true, addedScore: newScore, newMu: nextMu, streak: { current: nextStreak, best: nextBest } })
+  return c.json({ ok: true, correct, addedScore: newScore, newMu: nextMu, streak: { current: nextStreak, best: nextBest } })
 })
 
 /** ---------- Health ---------- */
@@ -576,21 +624,38 @@ app.get('/me', async (c) => {
 export default {
   fetch: app.fetch,
   scheduled: async (_event: ScheduledEvent, env: Env, _ctx: ExecutionContext) => {
-    // Nightly capacity plan
-    const targetTonight = 100_000
-    const batch = 2_000
+    // Nightly generation: add 100 new questions per night
+    // Goal: reach 100k questions per language across all difficulties
+    const langs = ['en', 'ru']           // extend later with es, pt-BR, fr, de, it, hi, etc.
+    const regions = ['global']           // add 'RU','US','IN','MX','BR','EU' later
+    const nightlyTarget = 100            // generate 100 questions per night
+    const maxTotalPerLang = 100_000      // stop when reaching 100k per language
 
-    let remaining = targetTonight
-    while (remaining > 0) {
-      const langs = ['en', 'ru']           // extend later with es, pt-BR, fr, de, it, hi, etc.
-      const regions = ['global']           // add 'RU','US','IN','MX','BR','EU' later
-      try {
-        const { inserted } = await generateAndIngest({ env }, { langs, regions, count: batch })
-        if (inserted === 0) break
-        remaining -= inserted
-      } catch {
-        break // back off on any error this run
+    try {
+      // Check current count for each language
+      for (const lang of langs) {
+        const countResult = await env.DB.prepare(
+          'SELECT COUNT(*) as count FROM question WHERE lang = ?'
+        ).bind(lang).first<{ count: number }>()
+
+        const currentCount = countResult?.count ?? 0
+
+        // Skip if we've already reached the target for this language
+        if (currentCount >= maxTotalPerLang) {
+          console.log(`[CRON] Language ${lang} already has ${currentCount} questions (target: ${maxTotalPerLang}). Skipping.`)
+          continue
+        }
+
+        const remaining = maxTotalPerLang - currentCount
+        const toGenerate = Math.min(nightlyTarget, remaining)
+
+        console.log(`[CRON] Generating ${toGenerate} questions for ${lang} (current: ${currentCount}/${maxTotalPerLang})`)
+
+        const { inserted } = await generateAndIngest({ env }, { langs: [lang], regions, count: toGenerate })
+        console.log(`[CRON] Successfully inserted ${inserted} questions for ${lang}`)
       }
+    } catch (e: any) {
+      console.error('[CRON] Failed:', e.message)
     }
   }
 }
