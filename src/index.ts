@@ -774,7 +774,7 @@ async function insertWithTranslations(c: any, items: GenItem[]) {
           lang,
           translation.prompt.trim(),
           JSON.stringify(translation.options),
-          translation.correct_idx
+          translation.correct_idx - 1  // Convert from 1-based (OpenAI) to 0-based (database)
         )
       )
     }
