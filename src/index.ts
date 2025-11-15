@@ -221,16 +221,27 @@ app.post('/session/finish', async (c) => {
     })
   }
 
+  // Batch fetch current weights for all categories
+  const categories = Array.from(categoryScores.keys())
+  let currentWeights = new Map<string, number>()
+
+  if (categories.length > 0) {
+    const placeholders = categories.map(() => '?').join(',')
+    const weightResults = await c.env.DB
+      .prepare(`SELECT topic, weight FROM topic_pref WHERE user_id = ? AND topic IN (${placeholders})`)
+      .bind(userId, ...categories)
+      .all<{ topic: string, weight: number }>()
+
+    for (const row of weightResults.results || []) {
+      currentWeights.set(row.topic, row.weight)
+    }
+  }
+
   for (const [category, stats] of categoryScores) {
     const accuracy = stats.correct / stats.total
     const delta = accuracy > 0.7 ? 0.2 : (accuracy < 0.3 ? -0.2 : 0)
+    const next = Math.max(-5, Math.min(5, (currentWeights.get(category) ?? 0) + delta))
 
-    const current = await c.env.DB
-      .prepare('SELECT weight FROM topic_pref WHERE user_id = ? AND topic = ?')
-      .bind(userId, category)
-      .first<{ weight: number }>()
-
-    const next = Math.max(-5, Math.min(5, (current?.weight ?? 0) + delta))
     categoryUpdates.push(
       c.env.DB.prepare(
         `INSERT INTO topic_pref(user_id, topic, weight)
@@ -328,31 +339,6 @@ app.get('/quiz/next', async (c) => {
   }
   allQuestions.push(...newQuestions)
 
-  // Fallback to old question table for backward compatibility
-  if (allQuestions.length < over) {
-    let { results } = await c.env.DB.prepare(
-      `SELECT id, prompt, options, correct_idx, difficulty
-       FROM question
-       WHERE lang = ? AND category = ? AND CAST(difficulty AS INTEGER) BETWEEN ? AND ?
-       ORDER BY CAST(difficulty AS INTEGER) ASC, created_at DESC
-       LIMIT ?`
-    ).bind(lang, category, minDiff, maxDiff, over - allQuestions.length).all<{ id: string, prompt: string, options: string, correct_idx: number, difficulty: number }>()
-
-    // If still no results and lang != 'en', try English from old table
-    if (results.length === 0 && lang !== 'en') {
-      const fallback = await c.env.DB.prepare(
-        `SELECT id, prompt, options, correct_idx, difficulty
-         FROM question
-         WHERE lang = 'en' AND category = ? AND CAST(difficulty AS INTEGER) BETWEEN ? AND ?
-         ORDER BY CAST(difficulty AS INTEGER) ASC, created_at DESC
-         LIMIT ?`
-      ).bind(category, minDiff, maxDiff, over - allQuestions.length).all<{ id: string, prompt: string, options: string, correct_idx: number, difficulty: number }>()
-      results = fallback.results
-    }
-
-    allQuestions.push(...results)
-  }
-
   // If still not enough questions, progressively widen difficulty range
   let expandRange = 1
   while (allQuestions.length < n && expandRange <= 3) {
@@ -368,52 +354,7 @@ app.get('/quiz/next', async (c) => {
       }
     }
 
-    // Try old structure with wider range
-    if (allQuestions.length < n) {
-      let { results } = await c.env.DB.prepare(
-        `SELECT id, prompt, options, correct_idx, difficulty
-         FROM question
-         WHERE lang = ? AND category = ? AND CAST(difficulty AS INTEGER) BETWEEN ? AND ?
-         ORDER BY CAST(difficulty AS INTEGER) ASC, created_at DESC
-         LIMIT ?`
-      ).bind(lang, category, widerMin, widerMax, n - allQuestions.length).all<{ id: string, prompt: string, options: string, correct_idx: number, difficulty: number }>()
-
-      // English fallback
-      if (results.length === 0 && lang !== 'en') {
-        const fallback = await c.env.DB.prepare(
-          `SELECT id, prompt, options, correct_idx, difficulty
-           FROM question
-           WHERE lang = 'en' AND category = ? AND CAST(difficulty AS INTEGER) BETWEEN ? AND ?
-           ORDER BY CAST(difficulty AS INTEGER) ASC, created_at DESC
-           LIMIT ?`
-        ).bind(category, widerMin, widerMax, n - allQuestions.length).all<{ id: string, prompt: string, options: string, correct_idx: number, difficulty: number }>()
-        results = fallback.results
-      }
-
-      for (const q of results) {
-        if (!allQuestions.find(existing => existing.id === q.id)) {
-          allQuestions.push(q)
-        }
-      }
-    }
-
     expandRange++
-  }
-
-  // Final fallback: any category, any difficulty, requested language
-  if (allQuestions.length < n) {
-    console.log('[/quiz/next] Final fallback: any category, any difficulty')
-    const fallback = await c.env.DB.prepare(
-      `SELECT id, prompt, options, correct_idx, difficulty FROM question
-       WHERE lang = ?
-       ORDER BY CAST(difficulty AS INTEGER) ASC, created_at DESC
-       LIMIT ?`
-    ).bind(lang, n - allQuestions.length).all<{ id: string, prompt: string, options: string, correct_idx: number, difficulty: number }>()
-    for (const q of fallback.results) {
-      if (!allQuestions.find(existing => existing.id === q.id)) {
-        allQuestions.push(q)
-      }
-    }
   }
 
   const seenRaw = await c.env.KV.get(`seen:${userId}`)
@@ -467,102 +408,6 @@ app.get('/quiz/next', async (c) => {
  *  All answer processing now happens in /session/finish endpoint.
  *  Keeping this code commented for potential rollback.
  */
-
-/*
-app.post('/quiz/answer', async (c) => {
-  const userId = c.req.header('x-user') || ''
-  const { questionId, selectedIdx, timeMs, sessionId } = await c.req.json() as {
-    questionId: string, selectedIdx: number, timeMs?: number, sessionId?: string
-  }
-
-  // Try new translation structure first
-  let q = await c.env.DB.prepare(
-    `SELECT qb.difficulty, qb.category, qt.correct_idx
-     FROM question_base qb
-     INNER JOIN question_translation qt ON qb.id = qt.base_id
-     WHERE qb.id = ?
-     LIMIT 1`
-  ).bind(questionId).first<{ difficulty?: number, category?: string, correct_idx?: number }>()
-
-  // Fallback to old question table
-  if (!q) {
-    q = await c.env.DB.prepare(
-      'SELECT difficulty, category, correct_idx FROM question WHERE id = ?'
-    ).bind(questionId).first<{ difficulty?: string | number, category?: string, correct_idx?: number }>()
-  }
-
-  if (!q) {
-    return c.json({ error: 'question_not_found' }, 404)
-  }
-
-  // Both database and frontend use 0-based indexing
-  const correct = selectedIdx === q.correct_idx
-  const d = clamp(typeof q.difficulty === 'number' ? q.difficulty : parseInt(String(q.difficulty ?? '3'), 10) || 3, 1, 6)
-
-  const rowSkill = await c.env.DB.prepare(
-    'SELECT mu FROM user_skill WHERE user_id = ?'
-  ).bind(userId).first<{ mu: number }>()
-  const mu = rowSkill?.mu ?? 3.0
-
-  const rowStreak = await c.env.DB.prepare(
-    'SELECT current_streak, best_streak FROM streak_state WHERE user_id = ?'
-  ).bind(userId).first<{ current_streak: number, best_streak: number }>()
-
-  const curStreak = rowStreak?.current_streak ?? 0
-  const newScore = calcScore(correct, d, timeMs, curStreak)
-
-  const nextStreak = correct ? curStreak + 1 : 0
-  const nextBest = Math.max(rowStreak?.best_streak ?? 0, nextStreak)
-
-  const nextMu = updateMu(mu, !!correct, timeMs)
-
-  const statements: D1PreparedStatement[] = [
-    c.env.DB.prepare(
-      'INSERT OR REPLACE INTO user_answer (user_id, question_id, correct) VALUES (?, ?, ?)'
-    ).bind(userId, questionId, correct ? 1 : 0),
-
-    c.env.DB.prepare(
-      'INSERT OR REPLACE INTO user_skill (user_id, mu, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)'
-    ).bind(userId, nextMu),
-
-    c.env.DB.prepare(
-      'INSERT OR REPLACE INTO streak_state (user_id, current_streak, best_streak, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)'
-    ).bind(userId, nextStreak, nextBest),
-  ]
-
-  if (sessionId) {
-    statements.push(
-      c.env.DB.prepare(
-        'UPDATE run_session SET score = score + ?, max_streak = MAX(max_streak, ?) WHERE id = ? AND user_id = ?'
-      ).bind(newScore, nextStreak, sessionId, userId)
-    )
-  }
-
-  await c.env.DB.batch(statements)
-
-  const seenRaw = await c.env.KV.get(`seen:${userId}`)
-  const arr: string[] = seenRaw ? JSON.parse(seenRaw) : []
-  if (!arr.includes(questionId)) arr.push(questionId)
-  await c.env.KV.put(`seen:${userId}`, JSON.stringify(arr), { expirationTtl: 60 * 60 * 24 * 30 })
-
-if (q?.category) {
-  const delta = correct ? 0.2 : -0.05
-  const current = await c.env.DB
-    .prepare('SELECT weight FROM topic_pref WHERE user_id = ? AND topic = ?')
-    .bind(userId, q.category)
-    .first<{ weight: number }>()
-  const next = Math.max(-5, Math.min(5, (current?.weight ?? 0) + delta))
-  await c.env.DB.prepare(
-    `INSERT INTO topic_pref(user_id, topic, weight)
-     VALUES (?, ?, ?)
-     ON CONFLICT(user_id, topic) DO UPDATE SET weight = ?`
-  ).bind(userId, q.category, next, next).run()
-}
-
-
-  return c.json({ ok: true, correct, addedScore: newScore, newMu: nextMu, streak: { current: nextStreak, best: nextBest } })
-})
-*/
 
 /** ---------- Health ---------- */
 app.get('/health', (c) => c.json({ ok: true }))
@@ -618,48 +463,7 @@ async function lightVerify(url: string, answerSnippet: string): Promise<{ ok: bo
   } catch { return { ok: false } }
 }
 
-async function insertBatch(c: any, lang: string, region: string, items: GenItem[]) {
-  const stmts: D1PreparedStatement[] = []
-  for (const it of items) {
-    if (!it.options?.length || it.correct_idx < 1 || it.correct_idx > it.options.length) continue
-    const prompt = it.prompt.trim()
-    const normHash = normalizeHash(it.lang, it.category, prompt)
-    const ans = it.options[it.correct_idx - 1]
-
-    let verified = 0
-    let sourceTitles: string[] = []
-    if (it.sources?.length) {
-      const v = await lightVerify(it.sources[0].url, ans)
-      verified = v.ok ? 1 : 0
-      sourceTitles = it.sources.map(s => s.title || (s.url === it.sources[0].url ? v.title : ''))
-    }
-
-    stmts.push(
-      c.env.DB.prepare(
-        `INSERT OR IGNORE INTO question
-         (id, lang, category, difficulty, prompt, options, correct_idx, normalized_hash, source_urls, source_titles, region, verified)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).bind(
-        crypto.randomUUID(),
-        it.lang,
-        it.category,
-        String(Math.max(1, Math.min(6, Math.floor(it.difficulty)))),
-        prompt,
-        JSON.stringify(it.options),
-        it.correct_idx,
-        normHash,
-        JSON.stringify(it.sources?.map(s => s.url) || []),
-        JSON.stringify(sourceTitles),
-        it.region || region || 'global',
-        verified
-      )
-    )
-  }
-  if (stmts.length) await c.env.DB.batch(stmts)
-  return stmts.length
-}
-
-// New optimized insert using translation structure with deduplication and validation
+// Optimized insert using translation structure with deduplication and validation
 async function insertWithTranslations(c: any, items: GenItem[]) {
   console.log(`[insertWithTranslations] Processing ${items.length} items`)
 
@@ -787,77 +591,7 @@ async function insertWithTranslations(c: any, items: GenItem[]) {
   return Math.floor(stmts.length / 4) // Each base has 1 base + 3 translations = 4 statements
 }
 
-async function generateAndIngest(c: any, opts: { langs: string[], regions: string[], count: number }) {
-  const sys = `You are a rigorous multilingual trivia question generator.
-Return ONLY valid JSON Lines (one JSON object per line, no trailing commas).
-Family-friendly content. Verifiable facts. NO time-sensitive or contentious topics.
-
-CRITICAL FORMAT REQUIREMENTS:
-- EXACTLY 4 answer options per question (no more, no less)
-- correct_idx must be 1, 2, 3, or 4 (1-based index)
-- Each option must be concise (max 100 characters)
-- Include 1-3 reputable sources with working URLs
-- One question per line (JSONL format)`
-
-  const usr = `Generate ${opts.count} trivia questions following these specifications:
-
-DISTRIBUTION:
-- languages: ${JSON.stringify(opts.langs)} (distribute evenly across languages)
-- target regions: ${JSON.stringify(opts.regions)}
-- categories: ["general","science","history","geography","tech","movies","music","sports","literature","nature","popculture","logic","math"]
-- difficulty levels (1-6): {"1":15%,"2":25%,"3":25%,"4":20%,"5":10%,"6":5%}
-
-OUTPUT FORMAT (JSONL):
-{"lang":"en","region":"global","category":"science","difficulty":3,"prompt":"What is the chemical symbol for gold?","options":["Au","Ag","Fe","Cu"],"correct_idx":1,"sources":[{"url":"https://example.com/gold","title":"Gold Properties"}]}
-
-VALIDATION CHECKLIST for each question:
-✓ Exactly 4 options
-✓ correct_idx between 1-4
-✓ Category from allowed list
-✓ Difficulty between 1-6
-✓ At least 1 source with valid URL
-✓ Question text is clear and unambiguous
-✓ Only ONE correct answer
-
-Generate exactly ${opts.count} lines of valid JSONL.`
-
-  const text = await callOpenAI(c.env.OPENAI_API_KEY, [
-    { role: 'system', content: sys },
-    { role: 'user', content: usr },
-  ], 16000)
-
-  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean)
-  const parsed: GenItem[] = []
-  for (const line of lines) {
-    try {
-      const item = JSON.parse(line)
-      // Strict validation
-      if (item.options?.length === 4 &&
-          item.correct_idx >= 1 && item.correct_idx <= 4 &&
-          item.prompt && item.category && item.lang) {
-        parsed.push(item)
-      } else {
-        console.warn('[Generator] Invalid item skipped:', line.slice(0, 100))
-      }
-    } catch {
-      console.warn('[Generator] Parse failed:', line.slice(0, 100))
-    }
-  }
-
-  const byLang = new Map<string, GenItem[]>()
-  for (const it of parsed) {
-    if (!byLang.has(it.lang)) byLang.set(it.lang, [])
-    byLang.get(it.lang)!.push(it)
-  }
-
-  let inserted = 0
-  for (const [lang, arr] of byLang) {
-    inserted += await insertBatch({ env: c.env }, lang, 'global', arr)
-  }
-  return { requested: opts.count, parsed: parsed.length, inserted }
-}
-
-// NEW: Get recent questions for deduplication context
+// Get recent questions for deduplication context
 async function getSampleRecentQuestions(db: D1Database, category: string | null, limit: number = 50): Promise<string[]> {
   try {
     let query = 'SELECT qt.prompt FROM question_translation qt WHERE qt.lang = \'en\''
